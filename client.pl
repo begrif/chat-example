@@ -7,7 +7,9 @@ my ($timeout, $got_timeout);
 $remote  = shift || "localhost";
 $port    = shift || 2345;  # random port
 
+$got_timeout = 'timeout!';
 $timeout = 1;
+sub ALARM { die "$got_timeout\n" }
 
 if ($port =~ /\D/) { $port = getservbyname($port, "tcp") }
 die "No port" unless $port;
@@ -23,24 +25,32 @@ $| = 1;
 select(STDOUT);
 $| = 1;
 
-sub ALARM { $got_timeout = 1; }
-$SIG{ALRM} = \&ALARM;
-
 for ( ;; ) {
-  alarm $timeout;
 
-  $line = <SOCK>;
+  $line = read_with_timout(*SOCK);
   if (length($line)) {
       print $line;
-  } else {
-    alarm $timeout;
   }
 
-  $line = <STDIN>;
+  $line = read_with_timout(*STDIN);
   if (length($line)) {
       print SOCK $line;
   }
 }
 
 close (SOCK)                        || die "close: $!";
+
+# read wrapper that uses a timeout to avoid perpetual blocking
+sub read_with_timout {
+  my $fh = shift;
+  my $line;
+  eval {
+        local $SIG{ALRM} = \&ALARM;
+        alarm $timeout;
+        $line = <$fh>;
+        alarm 0;
+       };
+  if ($@ and $@ !~ /$got_timeout/) { logmsg("during socket read: $@\n")}
+  return $line;
+} # end &read_with_timout
 
