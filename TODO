@@ -1,0 +1,5 @@
+Factor common code out into a module.
+
+More server messages ("User left chat", "Users already in chat")
+
+Consider replacing loop over chat file handles with select()
