@@ -3,11 +3,13 @@ use strict;
 BEGIN { $ENV{PATH} = "/usr/bin:/bin" }
 use Socket;
 use POSIX;
-use Carp;
+use Time::HiRes qw( alarm );
+
 my $EOL = "\015\012";
 my @chatters;
 my $got_timeout = 'timeout!';
-my $timeout = 1;
+my $timeout = 0.0100; # microseconds
+my $closed;
 
 sub logmsg { print "$0 $$: @_ at ", scalar localtime(), "\n" }
 
@@ -32,9 +34,15 @@ $| = 1;
 
 logmsg "server started on port $port";
 
-# $SIG{CHLD} = \&REAPER;
 sub ALARM { die "$got_timeout\n" }
+sub CATCHPIPE { $closed = 1; die "sigpipe\n" }
+$SIG{PIPE} = \&CATCHPIPE;
 
+# main loop
+#	checks for new connections (with timeout)
+#		sends welcome to new user
+#	checks for new messages from all existing connections (with timeout)
+#		forwards messages to all other users
 for ( ;; ) {
   # new version of $paddr and Client every time through
   my $paddr;
@@ -61,23 +69,24 @@ for ( ;; ) {
 
 
       logmsg "connection from $name [", inet_ntoa($iaddr), "] at port $port";
-      print Client "Hello there. Your first entry should be your username$EOL";
+      write_with_protection(*Client, "Hello there. Your first entry should be your username$EOL");
     }
   } # if new client
   
   if ($@ and $@ !~ /$got_timeout/) { die "Issue in accept(): $@\n"; }
 
+  my $gone = 0;
   for my $ch (@chatters) {
     my $handle = $$ch{fh};
     my $in = read_with_timout($handle);
     if (length($in)) {
-       logmsg "got $$ch{port} message: $in";
        my $send;
 
        $in =~ s/^\s*//;
        $in =~ s/\s*$//;
 
        if(length($in)) {
+         logmsg "got $$ch{port} message: $in";
 	 if(!defined($$ch{user})) {
 	   $$ch{user} = $in;
 
@@ -91,13 +100,27 @@ for ( ;; ) {
 	 for my $ls (@chatters) {
 	   next if $$ls{sender};
 	   my $outhandle = $$ls{fh};
-	   print $outhandle $send;
+           write_with_protection($outhandle, $send);
+	   if($closed) {
+	     logmsg("lost user on $$ls{port}");
+	     $$ls{closed} = 1;
+	     $gone ++;
+	   }
 	 }
 	 $$ch{sender} = undef;
 
       } # got something to share
     }
   } # check for chat messages
+
+  # prune dead users
+  if($gone) {
+     my @new_list;
+     for my $ch (@chatters) {
+       push(@new_list, $ch) unless $$ch{closed};
+     }
+     @chatters = @new_list;
+  }
 }
 
 # accept wrapper that uses a timeout to avoid perpetual blocking
@@ -119,13 +142,30 @@ sub accept_with_timeout {
 sub read_with_timout {
   my $fh = shift;
   my $line;
+  my $rv;
   eval {
         local $SIG{ALRM} = \&ALARM;
         alarm $timeout;
-        $line = <$fh>;
+	# try to read a big number of bytes, expect to get much less
+        $rv = sysread $fh, $line, 9999;
         alarm 0;
        };
-  if ($@ and $@ !~ /$got_timeout/) { logmsg("during socket read: $@\n")}
+  if ($@ and $@ !~ /$got_timeout/) { logmsg("during socket read: $@") }
+  # error code 4: interrupted syscall (eg, alarm went off)
+  if (!defined($rv) and 4 != 0+$!) { $closed = 1; logmsg("read failed: $!"); return ''; }
   return $line;
 } # end &read_with_timout
 
+
+# capture SIGPIPE errors
+sub write_with_protection {
+  my $fh = shift;
+  my $msg = shift;
+  my $rv;
+  $closed = undef;
+  eval {
+         $rv = syswrite $fh, $msg;
+       };
+  if ($@ and $closed) { logmsg("socket closed")}
+  if (!defined($rv)) { $closed = 1; logmsg("write failed: $!"); }
+}
